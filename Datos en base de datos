@@ -1,0 +1,386 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include "DHT.h"
+#include "HX711.h"
+
+// --------------- VARIABLES GLOBALES ----------------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+#define LED_ROJO 5
+#define LED_VERDE 21
+#define LED_AZUL 22
+
+#define DT 19
+#define SCK 18
+HX711 balanza;
+float factor_escala = 231.20;
+
+const int PIN_A = 14;
+const int PIN_B = 27;
+
+unsigned long previousLedMillis = 0;
+bool ledState = false;
+unsigned long previousMillis = 0;
+
+// Variables para valores desde BD
+float TEMP_MIN, TEMP_MAX, TEMP_EXMIN, TEMP_EXMAX;
+float HUM_MIN, HUM_MAX, HUM_EXMIN, HUM_EXMAX;
+float PESO_MIN, PESO_MAX, PESO_EXMIN, PESO_EXMAX;
+String ssid, password, host, BOTtoken, CHAT_ID;
+int port;
+int ID_TARJ = 1;
+int total_abejas = 100; // se sobreescribe al obtener config
+const int watchdog = 12000;
+
+// Telegram bot
+WiFiClientSecure secured_client;
+UniversalTelegramBot* bot;
+unsigned long bot_lasttime;
+
+// Variables de alertas y estado
+String estado_colmena;
+bool alertaTemperaturaActiva = false;
+bool alertaHumedadActiva = false;
+bool alertaPesoActiva = false;
+
+// Variables conteo abejas
+int conteo_abejas = 0;
+volatile uint32_t countIn  = 0;
+volatile uint32_t countOut = 0;
+
+// Parámetros FSM conteo
+const uint32_t DEBOUNCE_US    = 2000;
+const uint32_t PAIR_WINDOW_US = 50000;
+const uint32_t COOLDOWN_US    = 30000;
+const uint32_t STUCK_MS       = 1200;
+
+enum BeeState { IDLE, A_BLOCK, B_BLOCK, BOTH_BLOCK, COOLDOWN };
+BeeState beeState = IDLE;
+int prevA = HIGH, prevB = HIGH;
+uint32_t lastChangeA_us = 0, lastChangeB_us = 0;
+uint32_t tA_fall = 0, tB_fall = 0;
+uint32_t cooldown_until_us = 0;
+uint32_t stuckA_ms = 0, stuckB_ms = 0;
+
+// ------------ FUNCIÓN PARA OBTENER VALORES DESDE BD -------------
+void obtenerConfigDesdeDB() {
+  WiFiClient client;
+  if (client.connect("10.207.15.212", 80)) {
+    client.print(String("GET /proyecto_colmenas/config_colmena.php HTTP/1.1\r\n") +
+                 "Host: 10.207.15.212\r\n" +
+                 "Connection: close\r\n\r\n");
+
+    while (client.connected()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r") break;
+    }
+    String respuesta = "";
+    while (client.available()) {
+      respuesta += client.readString();
+    }
+
+    StaticJsonDocument<1536> doc;
+    DeserializationError error = deserializeJson(doc, respuesta);
+
+    if (!error) {
+      TEMP_MIN = doc["TEMP_MIN"].as<float>();
+      TEMP_MAX = doc["TEMP_MAX"].as<float>();
+      TEMP_EXMIN = doc["TEMP_EXMIN"].as<float>();
+      TEMP_EXMAX = doc["TEMP_EXMAX"].as<float>();
+      HUM_MIN = doc["HUM_MIN"].as<float>();
+      HUM_MAX = doc["HUM_MAX"].as<float>();
+      HUM_EXMIN = doc["HUM_EXMIN"].as<float>();
+      HUM_EXMAX = doc["HUM_EXMAX"].as<float>();
+      PESO_MIN = doc["PESO_MIN"].as<float>();
+      PESO_MAX = doc["PESO_MAX"].as<float>();
+      PESO_EXMIN = doc["PESO_EXMIN"].as<float>();
+      PESO_EXMAX = doc["PESO_EXMAX"].as<float>();
+      ssid = doc["ssid"].as<String>();
+      password = doc["password"].as<String>();
+      host = doc["host"].as<String>();
+      port = doc["port"].as<int>();
+      BOTtoken = doc["BOTtoken"].as<String>();
+      CHAT_ID = doc["CHAT_ID"].as<String>();
+      total_abejas = doc["total_abejas"].as<int>();
+      Serial.println("Config BD cargada correctamente!");
+    } else {
+      Serial.println("Error parseando la configuración");
+    }
+  } else {
+    Serial.println("No se pudo conectar para obtener configuración.");
+  }
+}
+
+// ===================== CONTEO ABEJAS (FSM sin ISR) =====================
+void beeCounterUpdate() {
+  const uint32_t now_us = micros();
+
+  int a = digitalRead(PIN_A);
+  if (a != prevA && (now_us - lastChangeA_us) > DEBOUNCE_US) {
+    lastChangeA_us = now_us;
+    if (a == LOW) tA_fall = now_us;
+    prevA = a;
+  }
+
+  int b = digitalRead(PIN_B);
+  if (b != prevB && (now_us - lastChangeB_us) > DEBOUNCE_US) {
+    lastChangeB_us = now_us;
+    if (b == LOW) tB_fall = now_us;
+    prevB = b;
+  }
+
+  static uint32_t lastHighA_ms = 0, lastHighB_ms = 0;
+  uint32_t now_ms = millis();
+  if (a == HIGH) lastHighA_ms = now_ms;
+  if (b == HIGH) lastHighB_ms = now_ms;
+  stuckA_ms = (a == LOW) ? (now_ms - lastHighA_ms) : 0;
+  stuckB_ms = (b == LOW) ? (now_ms - lastHighB_ms) : 0;
+  if (stuckA_ms > STUCK_MS || stuckB_ms > STUCK_MS) {
+    beeState = IDLE;
+    return;
+  }
+
+  switch (beeState) {
+    case IDLE:
+      if (a == LOW && b == HIGH) {
+        beeState = A_BLOCK;
+      } else if (b == LOW && a == HIGH) {
+        beeState = B_BLOCK;
+      } else if (a == LOW && b == LOW) {
+        beeState = BOTH_BLOCK;
+      }
+      break;
+    case A_BLOCK:
+      if (b == LOW) {
+        if ((int32_t)(tB_fall - tA_fall) > 0 && (tB_fall - tA_fall) <= PAIR_WINDOW_US) {
+          countOut++;
+          beeState = BOTH_BLOCK;
+        } else {
+          beeState = BOTH_BLOCK;
+        }
+      } else if (a == HIGH) {
+        beeState = IDLE;
+      }
+      break;
+    case B_BLOCK:
+      if (a == LOW) {
+        if ((int32_t)(tA_fall - tB_fall) > 0 && (tA_fall - tB_fall) <= PAIR_WINDOW_US) {
+          countIn++;
+          beeState = BOTH_BLOCK;
+        } else {
+          beeState = BOTH_BLOCK;
+        }
+      } else if (b == HIGH) {
+        beeState = IDLE;
+      }
+      break;
+    case BOTH_BLOCK:
+      if (a == HIGH && b == HIGH) {
+        cooldown_until_us = now_us + COOLDOWN_US;
+        beeState = COOLDOWN;
+      }
+      break;
+    case COOLDOWN:
+      if ((int32_t)(now_us - cooldown_until_us) >= 0) {
+        beeState = IDLE;
+      }
+      break;
+  }
+}
+
+// -------------------- ALERTAS TELEGRAM --------------------
+void handleNewMessages(int h, float t, float peso_colmena) {
+  Serial.print("temperatura: "); Serial.println(t);
+  Serial.print("humedad: "); Serial.println(h);
+  Serial.print("Lectura en bruto: "); Serial.println(peso_colmena, 1);
+
+  bool errorTemperatura = isnan(t);
+  bool errorHumedad     = isnan(h);
+  bool errorPeso        = isnan(peso_colmena);
+
+  bool riesgoTemperatura = (t < TEMP_EXMIN || t > TEMP_EXMAX);
+  bool riesgoHumedad     = (h < HUM_EXMIN || h > HUM_EXMAX);
+  bool riesgoPeso        = (peso_colmena < PESO_EXMIN || peso_colmena > PESO_EXMAX);
+
+  bool anomaliaTemperatura = (t < TEMP_MIN || t > TEMP_MAX);
+  bool anomaliaHumedad     = (h < HUM_MIN || h > HUM_MAX);
+  bool anomaliaPeso        = (peso_colmena < PESO_MIN || peso_colmena > PESO_MAX);
+
+  if (errorTemperatura && !alertaTemperaturaActiva) {
+    bot->sendMessage(CHAT_ID, "❌ ERROR: Sensor de temperatura", "");
+    alertaTemperaturaActiva = true;
+  } 
+  else if (riesgoTemperatura && !alertaTemperaturaActiva) {
+    bot->sendMessage(CHAT_ID, "⚠ RIESGO: Temperatura extrema: " + String(t) + "°C", "");
+    alertaTemperaturaActiva = true;
+  }
+  else if (anomaliaTemperatura && !alertaTemperaturaActiva) {
+    bot->sendMessage(CHAT_ID, "📉 ANOMALÍA: Temperatura fuera de rango: " + String(t) + "°C", "");
+    alertaTemperaturaActiva = true;
+  }
+  else if (!errorTemperatura && !riesgoTemperatura && !anomaliaTemperatura && alertaTemperaturaActiva) {
+    bot->sendMessage(CHAT_ID, "✅ Temperatura volvió a normalidad.", "");
+    alertaTemperaturaActiva = false;
+  }
+
+  if (errorHumedad && !alertaHumedadActiva) {
+    bot->sendMessage(CHAT_ID, "❌ ERROR: Sensor de humedad", "");
+    alertaHumedadActiva = true;
+  }
+  else if (riesgoHumedad && !alertaHumedadActiva) {
+    bot->sendMessage(CHAT_ID, "⚠ RIESGO: Humedad extrema: " + String(h) + "%", "");
+    alertaHumedadActiva = true;
+  }
+  else if (anomaliaHumedad && !alertaHumedadActiva) {
+    bot->sendMessage(CHAT_ID, "📉 ANOMALÍA: Humedad fuera de rango: " + String(h) + "%", "");
+    alertaHumedadActiva = true;
+  }
+  else if (!errorHumedad && !riesgoHumedad && !anomaliaHumedad && alertaHumedadActiva) {
+    bot->sendMessage(CHAT_ID, "✅ Humedad volvió a normalidad.", "");
+    alertaHumedadActiva = false;
+  }
+
+  if (errorPeso && !alertaPesoActiva) {
+    bot->sendMessage(CHAT_ID, "❌ ERROR: Sensor de peso", "");
+    alertaPesoActiva = true;
+  }
+  else if (riesgoPeso && !alertaPesoActiva) {
+    bot->sendMessage(CHAT_ID, "⚠ RIESGO: Peso extremo: " + String(peso_colmena) + " g", "");
+    alertaPesoActiva = true;
+  }
+  else if (anomaliaPeso && !alertaPesoActiva) {
+    bot->sendMessage(CHAT_ID, "📉 ANOMALÍA: Peso fuera de rango: " + String(peso_colmena) + " g", "");
+    alertaPesoActiva = true;
+  }
+  else if (!errorPeso && !riesgoPeso && !anomaliaPeso && alertaPesoActiva) {
+    bot->sendMessage(CHAT_ID, "✅ Peso volvió a normalidad.", "");
+    alertaPesoActiva = false;
+  }
+
+  delay(500);
+}
+
+// -------------------- CONFIGURACIÓN INICIAL --------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  dht.begin();
+
+  pinMode(LED_ROJO, OUTPUT);
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AZUL, OUTPUT);
+  digitalWrite(LED_ROJO, LOW);
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_AZUL, LOW);
+
+  WiFi.begin("Alison", "Alison12");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado!");
+
+  obtenerConfigDesdeDB();
+
+  WiFi.disconnect();
+  delay(1000);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi re-conectado con credenciales de BD!");
+
+  secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  bot = new UniversalTelegramBot(BOTtoken, secured_client);
+
+  Serial.println("Inicializando celda de carga...");
+  balanza.begin(DT, SCK);
+  balanza.set_scale(factor_escala);
+  balanza.tare();
+  Serial.println("Balanza lista.");
+
+  pinMode(PIN_A, INPUT_PULLUP);
+  pinMode(PIN_B, INPUT_PULLUP);
+}
+
+// -------------------- BUCLE PRINCIPAL --------------------
+void loop() {
+  uint32_t now = millis();
+
+  beeCounterUpdate();
+  conteo_abejas = total_abejas + (int)countIn - (int)countOut;
+  if (conteo_abejas < 0) conteo_abejas = 0;
+
+  if (now - previousMillis > (unsigned long)watchdog) {
+    previousMillis = now;
+
+    float peso = 0.0f;
+    if (balanza.is_ready()) {
+      peso = balanza.get_units(10);
+    } else {
+      Serial.println("WARN: balanza no lista");
+      peso = NAN;
+    }
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    handleNewMessages(h, t, peso);
+
+    Serial.printf("ENVIANDO -> Humedad: %.2f %% Temp: %.2f C Peso: %.2f g Abejas: %d\nTotal abejas : %d\n",
+                  h, t, peso, conteo_abejas, total_abejas);
+
+    ledState = !ledState;
+    if (isnan(h) || isnan(t) || isnan(peso)) {
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AZUL, LOW);
+      digitalWrite(LED_ROJO, ledState ? HIGH : LOW);
+      estado_colmena = "Error";
+    }
+    else if ((t < TEMP_EXMIN || t > TEMP_EXMAX) ||
+             (h < HUM_EXMIN || h > HUM_EXMAX) ||
+             (peso < PESO_EXMIN || peso > PESO_EXMAX)) {
+      digitalWrite(LED_AZUL, LOW);
+      digitalWrite(LED_ROJO, ledState ? HIGH : LOW);
+      digitalWrite(LED_VERDE, ledState ? HIGH : LOW);
+      estado_colmena = "Riesgo";
+    }
+    else if ((t < TEMP_MIN || t > TEMP_MAX) ||
+             (h < HUM_MIN || h > HUM_MAX) ||
+             (peso < PESO_MIN || peso > PESO_MAX)) {
+      digitalWrite(LED_ROJO, LOW);
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AZUL, ledState ? HIGH : LOW);
+      estado_colmena = "Anomalia";
+    }
+    else {
+      digitalWrite(LED_ROJO, LOW);
+      digitalWrite(LED_AZUL, LOW);
+      digitalWrite(LED_VERDE, ledState ? HIGH : LOW);
+      estado_colmena = "Normal";
+    }
+
+    WiFiClient client;
+    if (client.connect(host.c_str(), port)) {
+      String url = "/proyecto_colmenas/programas_php/programa1.php?";
+      url += "humedad="; url += String(h);
+      url += "&temperatura="; url += String(t);
+      url += "&conteo_abejas="; url += String(conteo_abejas);
+      url += "&ID_TARJ="; url += String(ID_TARJ);
+      url += "&peso_colmena="; url += String(peso);
+      url += "&total_abejas="; url += String(total_abejas);
+      url += "&estado_colmena="; url += estado_colmena;
+      client.print("POST "); client.print(url); client.println(" HTTP/1.1");
+      client.print("Host: "); client.println(host);
+      client.println("Connection: close");
+      client.println();
+    }
+    client.stop();
+    Serial.println("Dato ENVIADO (modo no bloqueante)");
+  }
+}
