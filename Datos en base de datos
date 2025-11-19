@@ -41,6 +41,9 @@ WiFiClientSecure secured_client;
 UniversalTelegramBot* bot;
 unsigned long bot_lasttime;
 
+String mensaje;
+String mensaje_normal;
+
 // Variables de alertas y estado
 String estado_colmena;
 bool alertaTemperaturaActiva = false;
@@ -210,57 +213,79 @@ void handleNewMessages(int h, float t, float peso_colmena) {
   bool anomaliaHumedad     = (h < HUM_MIN || h > HUM_MAX);
   bool anomaliaPeso        = (peso_colmena < PESO_MIN || peso_colmena > PESO_MAX);
 
+  mensaje = "ID de tarjeta: " + String(ID_TARJ);
+  mensaje_normal = "ID de tarjeta: " + String(ID_TARJ);
+
+  // ✅ TEMPERATURA
   if (errorTemperatura && !alertaTemperaturaActiva) {
-    bot->sendMessage(CHAT_ID, "❌ ERROR: Sensor de temperatura", "");
+    mensaje += "\n❌ ERROR: Sensor de temperatura: NaN";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaTemperaturaActiva = true;
   } 
   else if (riesgoTemperatura && !alertaTemperaturaActiva) {
-    bot->sendMessage(CHAT_ID, "⚠ RIESGO: Temperatura extrema: " + String(t) + "°C", "");
+    mensaje += "\n⚠ RIESGO: Temperatura extrema: " + String(t) + "°C";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaTemperaturaActiva = true;
   }
   else if (anomaliaTemperatura && !alertaTemperaturaActiva) {
-    bot->sendMessage(CHAT_ID, "📉 ANOMALÍA: Temperatura fuera de rango: " + String(t) + "°C", "");
+    mensaje += "\n📉 ANOMALÍA: Temperatura fuera de rango: " + String(t) + "°C";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaTemperaturaActiva = true;
   }
   else if (!errorTemperatura && !riesgoTemperatura && !anomaliaTemperatura && alertaTemperaturaActiva) {
-    bot->sendMessage(CHAT_ID, "✅ Temperatura volvió a normalidad.", "");
+    mensaje_normal += "\n✅ Temperatura volvió a normalidad.";
+    mensaje_normal += "\nTemperatura: " + String(t) + "°C";
+    bot.sendMessage(CHAT_ID, mensaje_normal, "");
     alertaTemperaturaActiva = false;
   }
 
+
+  // ✅ HUMEDAD
   if (errorHumedad && !alertaHumedadActiva) {
-    bot->sendMessage(CHAT_ID, "❌ ERROR: Sensor de humedad", "");
+    mensaje += "\n❌ ERROR: Sensor de humedad: NaN";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaHumedadActiva = true;
   }
   else if (riesgoHumedad && !alertaHumedadActiva) {
-    bot->sendMessage(CHAT_ID, "⚠ RIESGO: Humedad extrema: " + String(h) + "%", "");
+    mensaje += "\n⚠ RIESGO: Humedad extrema: " + String(h) + "%";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaHumedadActiva = true;
   }
   else if (anomaliaHumedad && !alertaHumedadActiva) {
-    bot->sendMessage(CHAT_ID, "📉 ANOMALÍA: Humedad fuera de rango: " + String(h) + "%", "");
+    mensaje += "\n📉 ANOMALÍA: Humedad fuera de rango: " + String(h) + "%";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaHumedadActiva = true;
   }
   else if (!errorHumedad && !riesgoHumedad && !anomaliaHumedad && alertaHumedadActiva) {
-    bot->sendMessage(CHAT_ID, "✅ Humedad volvió a normalidad.", "");
+    mensaje_normal += "\n✅ Humedad volvió a normalidad.";
+    mensaje_normal += "\nHumedad: " + String(h) + "%";
+    bot.sendMessage(CHAT_ID, mensaje_normal, "");
     alertaHumedadActiva = false;
   }
 
+
+  // ✅ PESO
   if (errorPeso && !alertaPesoActiva) {
-    bot->sendMessage(CHAT_ID, "❌ ERROR: Sensor de peso", "");
+    mensaje += "\n❌ ERROR: Sensor de peso: NaN"; 
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaPesoActiva = true;
   }
   else if (riesgoPeso && !alertaPesoActiva) {
-    bot->sendMessage(CHAT_ID, "⚠ RIESGO: Peso extremo: " + String(peso_colmena) + " g", "");
+    mensaje += "\n⚠ RIESGO: Peso extremo: " + String(peso_colmena) + " g";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaPesoActiva = true;
   }
   else if (anomaliaPeso && !alertaPesoActiva) {
-    bot->sendMessage(CHAT_ID, "📉 ANOMALÍA: Peso fuera de rango: " + String(peso_colmena) + " g", "");
+    mensaje += "\n📉 ANOMALÍA: Peso fuera de rango: " + String(peso_colmena) + " g";
+    bot.sendMessage(CHAT_ID, mensaje, "");
     alertaPesoActiva = true;
   }
   else if (!errorPeso && !riesgoPeso && !anomaliaPeso && alertaPesoActiva) {
-    bot->sendMessage(CHAT_ID, "✅ Peso volvió a normalidad.", "");
+    mensaje_normal += "\n✅ Peso volvió a normalidad.";
+    mensaje_normal += "\nPeso: " + String(peso_colmena) + " g";
+    bot.sendMessage(CHAT_ID, mensaje_normal, "");
     alertaPesoActiva = false;
   }
-
   delay(500);
 }
 
