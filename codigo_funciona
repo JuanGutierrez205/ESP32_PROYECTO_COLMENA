@@ -1,0 +1,401 @@
+// PROGRAMA DENOMINADO programa1.ino
+// PARA CAPTURAR DATOS DE LOS SENSORES, EL CONTEO DE ABEJAS
+// Y ENVIARLOS A UNA BASE DE DATOS EN UN SERVIDOR WEB.
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include "DHT.h"
+#include "HX711.h"
+
+String estado_colmena;
+
+// -------------------- CONFIGURACIÓN DHT --------------------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// -------------------- LED RGB --------------------
+#define LED_ROJO 5
+#define LED_VERDE 21
+#define LED_AZUL 22
+
+unsigned long previousLedMillis = 0;
+bool ledState = false;
+
+// umbrales de alerta
+const float TEMP_MIN = 16.0;
+const float TEMP_MAX = 30;
+const float HUM_MIN  = 40;
+const float HUM_MAX  = 70;
+const float PESO_MIN = 50; // 90g
+const float PESO_MAX = 4000;
+// umbrales de datos extremos
+const float TEMP_EXMIN = 0;
+const float TEMP_EXMAX = 40;
+const float HUM_EXMIN  = 20;
+const float HUM_EXMAX  = 80;
+const float PESO_EXMIN = 0;
+const float PESO_EXMAX = 5000;
+
+// -------------------- CONFIGURACIÓN WiFi --------------------
+const char* ssid = "Alison";
+const char* password = "Alison12";
+const char* host = "10.245.248.212";
+const int port = 80;
+const int watchdog = 12000;
+unsigned long previousMillis = 0; // inicializar en 0 (se actualizará en loop)
+
+int ID_TARJ = 1;
+
+// configuración de telegram
+#define BOTtoken "7514324234:AAEAMQcaVJibS8Kd-3dIYl2HALhoaoBkIY0"
+#define CHAT_ID "7087758562"
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOTtoken, secured_client);
+unsigned long bot_lasttime;
+
+// Variables globales
+bool alertaTemperaturaActiva = false;
+bool alertaHumedadActiva = false;
+bool alertaPesoActiva = false;
+
+// -------------------- CONFIGURACIÓN PESO (FACTOR FIJO) --------------------
+#define DT 19
+#define SCK 18
+HX711 balanza;
+float factor_escala = 231.20; // Factor de escala calibrado
+
+// -------------------- CONFIGURACIÓN CONTEO ABEJAS --------------------
+int conteo_abejas = 0;
+int total_abejas = 100;
+volatile uint32_t countIn  = 0;
+volatile uint32_t countOut = 0;
+
+
+const int PIN_A = 14;
+const int PIN_B = 27;
+
+// ===================== CONTEO ABEJAS (FSM sin ISR) =====================
+// Ajusta a tu túnel y sensores:
+const uint32_t DEBOUNCE_US     = 2000;   // 2 ms: filtra rebotes
+const uint32_t PAIR_WINDOW_US  = 50000;  // 80 ms: A->B o B->A deben ocurrir dentro de esta ventana
+const uint32_t COOLDOWN_US     = 30000;  // 30 ms: rearme tras liberar ambos
+const uint32_t STUCK_MS        = 1200;   // 1.2 s: sensor atascado
+
+// Estados del túnel
+enum BeeState { IDLE, A_BLOCK, B_BLOCK, BOTH_BLOCK, COOLDOWN };
+BeeState beeState = IDLE;
+
+int prevA = HIGH, prevB = HIGH;
+uint32_t lastChangeA_us = 0, lastChangeB_us = 0;
+uint32_t tA_fall = 0, tB_fall = 0;
+uint32_t cooldown_until_us = 0;
+uint32_t stuckA_ms = 0, stuckB_ms = 0;
+
+// Contadores globales ya existentes:
+// extern volatile uint32_t countIn;
+// extern volatile uint32_t countOut;
+
+// Llama desde loop() en cada iteración
+void beeCounterUpdate() {
+  const uint32_t now_us = micros();
+
+  // Lectura con detección de flanco y debounce por sensor
+  int a = digitalRead(PIN_A);
+  if (a != prevA && (now_us - lastChangeA_us) > DEBOUNCE_US) {
+    lastChangeA_us = now_us;
+    if (a == LOW) tA_fall = now_us; // flanco de bajada A
+    prevA = a;
+  }
+
+  int b = digitalRead(PIN_B);
+  if (b != prevB && (now_us - lastChangeB_us) > DEBOUNCE_US) {
+    lastChangeB_us = now_us;
+    if (b == LOW) tB_fall = now_us; // flanco de bajada B
+    prevB = b;
+  }
+
+  // Detección de atascos (opcional)
+  static uint32_t lastHighA_ms = 0, lastHighB_ms = 0;
+  uint32_t now_ms = millis();
+  if (a == HIGH) lastHighA_ms = now_ms;
+  if (b == HIGH) lastHighB_ms = now_ms;
+  stuckA_ms = (a == LOW) ? (now_ms - lastHighA_ms) : 0;
+  stuckB_ms = (b == LOW) ? (now_ms - lastHighB_ms) : 0;
+  if (stuckA_ms > STUCK_MS || stuckB_ms > STUCK_MS) {
+    // Sensor obstruido: no contamos, rearmamos limpio
+    beeState = IDLE;
+    return;
+  }
+
+  switch (beeState) {
+    case IDLE:
+      if (a == LOW && b == HIGH) {
+        beeState = A_BLOCK;
+      } else if (b == LOW && a == HIGH) {
+        beeState = B_BLOCK;
+      } else if (a == LOW && b == LOW) {
+        // Cayeron casi juntos: entra a BOTH y espera liberar
+        beeState = BOTH_BLOCK;
+      }
+      break;
+
+    case A_BLOCK:
+      if (b == LOW) {
+        // ¿B cayó a tiempo?
+        if ((int32_t)(tB_fall - tA_fall) > 0 && (tB_fall - tA_fall) <= PAIR_WINDOW_US) {
+          // A -> B  => OUT
+          countOut++;
+          // Espera liberar ambos para rearmar
+          beeState = BOTH_BLOCK;
+        } else {
+          // Llegó tarde o fuera de orden: descarta y rearmará al liberar
+          beeState = BOTH_BLOCK; // sigue ambos bajos o esperar liberar
+        }
+      } else if (a == HIGH) {
+        // Se liberó A sin que B cayera: falso disparo
+        beeState = IDLE;
+      }
+      break;
+
+    case B_BLOCK:
+      if (a == LOW) {
+        if ((int32_t)(tA_fall - tB_fall) > 0 && (tA_fall - tB_fall) <= PAIR_WINDOW_US) {
+          // B -> A  => IN
+          countIn++;
+          beeState = BOTH_BLOCK;
+        } else {
+          beeState = BOTH_BLOCK;
+        }
+      } else if (b == HIGH) {
+        beeState = IDLE;
+      }
+      break;
+
+    case BOTH_BLOCK:
+      // Rearme cuando ambos vuelvan a HIGH
+      if (a == HIGH && b == HIGH) {
+        cooldown_until_us = now_us + COOLDOWN_US;
+        beeState = COOLDOWN;
+      }
+      break;
+
+    case COOLDOWN:
+      if ((int32_t)(now_us - cooldown_until_us) >= 0) {
+        beeState = IDLE;
+      }
+      break;
+  }
+}
+
+// -------------------- ALERTAS TELEGRAM --------------------
+void handleNewMessages(int h, float t, float peso_colmena) {
+  Serial.print("temperatura: "); Serial.println(t);
+  Serial.print("humedad: "); Serial.println(h);
+  Serial.print("Lectura en bruto: "); Serial.println(peso_colmena, 1);
+
+  bool errorTemperatura = isnan(t);
+  bool errorHumedad     = isnan(h);
+  bool errorPeso        = isnan(peso_colmena);
+
+  bool riesgoTemperatura = (t < TEMP_EXMIN || t > TEMP_EXMAX);
+  bool riesgoHumedad     = (h < HUM_EXMIN || h > HUM_EXMAX);
+  bool riesgoPeso        = (peso_colmena < PESO_EXMIN || peso_colmena > PESO_EXMAX);
+
+  bool anomaliaTemperatura = (t < TEMP_MIN || t > TEMP_MAX);
+  bool anomaliaHumedad     = (h < HUM_MIN || h > HUM_MAX);
+  bool anomaliaPeso        = (peso_colmena < PESO_MIN || peso_colmena > PESO_MAX);
+
+  // ✅ TEMPERATURA
+  if (errorTemperatura && !alertaTemperaturaActiva) {
+    bot.sendMessage(CHAT_ID, "❌ ERROR: Sensor de temperatura", "");
+    alertaTemperaturaActiva = true;
+  } 
+  else if (riesgoTemperatura && !alertaTemperaturaActiva) {
+    bot.sendMessage(CHAT_ID, "⚠ RIESGO: Temperatura extrema: " + String(t) + "°C", "");
+    alertaTemperaturaActiva = true;
+  }
+  else if (anomaliaTemperatura && !alertaTemperaturaActiva) {
+    bot.sendMessage(CHAT_ID, "📉 ANOMALÍA: Temperatura fuera de rango: " + String(t) + "°C", "");
+    alertaTemperaturaActiva = true;
+  }
+  else if (!errorTemperatura && !riesgoTemperatura && !anomaliaTemperatura && alertaTemperaturaActiva) {
+    bot.sendMessage(CHAT_ID, "✅ Temperatura volvió a normalidad.", "");
+    alertaTemperaturaActiva = false;
+  }
+
+
+  // ✅ HUMEDAD
+  if (errorHumedad && !alertaHumedadActiva) {
+    bot.sendMessage(CHAT_ID, "❌ ERROR: Sensor de humedad", "");
+    alertaHumedadActiva = true;
+  }
+  else if (riesgoHumedad && !alertaHumedadActiva) {
+    bot.sendMessage(CHAT_ID, "⚠ RIESGO: Humedad extrema: " + String(h) + "%", "");
+    alertaHumedadActiva = true;
+  }
+  else if (anomaliaHumedad && !alertaHumedadActiva) {
+    bot.sendMessage(CHAT_ID, "📉 ANOMALÍA: Humedad fuera de rango: " + String(h) + "%", "");
+    alertaHumedadActiva = true;
+  }
+  else if (!errorHumedad && !riesgoHumedad && !anomaliaHumedad && alertaHumedadActiva) {
+    bot.sendMessage(CHAT_ID, "✅ Humedad volvió a normalidad.", "");
+    alertaHumedadActiva = false;
+  }
+
+
+  // ✅ PESO
+  if (errorPeso && !alertaPesoActiva) {
+    bot.sendMessage(CHAT_ID, "❌ ERROR: Sensor de peso", "");
+    alertaPesoActiva = true;
+  }
+  else if (riesgoPeso && !alertaPesoActiva) {
+    bot.sendMessage(CHAT_ID, "⚠ RIESGO: Peso extremo: " + String(peso_colmena) + " g", "");
+    alertaPesoActiva = true;
+  }
+  else if (anomaliaPeso && !alertaPesoActiva) {
+    bot.sendMessage(CHAT_ID, "📉 ANOMALÍA: Peso fuera de rango: " + String(peso_colmena) + " g", "");
+    alertaPesoActiva = true;
+  }
+  else if (!errorPeso && !riesgoPeso && !anomaliaPeso && alertaPesoActiva) {
+    bot.sendMessage(CHAT_ID, "✅ Peso volvió a normalidad.", "");
+    alertaPesoActiva = false;
+  }
+
+  if ((!errorTemperatura && !riesgoTemperatura && !anomaliaTemperatura) && alertaTemperaturaActiva) {
+    bot.sendMessage(CHAT_ID, "La temperatura ha vuelto al rango normal.", "");
+    alertaTemperaturaActiva = false;
+  } else if ((!errorHumedad && !riesgoHumedad && !anomaliaHumedad) && alertaHumedadActiva) {
+    bot.sendMessage(CHAT_ID, "La humedad ha vuelto al rango normal.", "");
+    alertaHumedadActiva = false;
+  } else if ((!errorPeso && !riesgoPeso && !anomaliaPeso) && alertaPesoActiva) {
+    bot.sendMessage(CHAT_ID, "El peso ha vuelto al rango normal.", "");
+    alertaPesoActiva = false;
+  }
+
+  delay(500);
+}
+
+// -------------------- CONFIGURACIÓN INICIAL --------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  dht.begin();
+
+  pinMode(LED_ROJO, OUTPUT);
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AZUL, OUTPUT);
+  digitalWrite(LED_ROJO, LOW);
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_AZUL, LOW);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a WiFi");
+  secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado!");
+
+  Serial.println("Inicializando celda de carga...");
+  balanza.begin(DT, SCK);
+  balanza.set_scale(factor_escala);
+  balanza.tare();
+  Serial.println("Balanza lista.");
+
+  pinMode(PIN_A, INPUT_PULLUP);
+  pinMode(PIN_B, INPUT_PULLUP);
+
+ 
+}
+
+// -------------------- BUCLE PRINCIPAL --------------------
+void loop() {
+  uint32_t now = millis();
+
+  // Conteo abejas (llamar cada iteración)
+  beeCounterUpdate();
+  conteo_abejas = total_abejas + (int)countIn - (int)countOut;
+  // si quieres, asegura no negativos:
+  // if (conteo_abejas < 0) conteo_abejas = 0;
+
+  // --- ENVÍO DE DATOS ---
+  if (now - previousMillis > (unsigned long)watchdog) {
+    previousMillis = now;
+
+    float peso = 0.0f;
+    if (balanza.is_ready()) {
+      peso = balanza.get_units(10);
+    } else {
+      Serial.println("WARN: balanza no lista");
+      peso = NAN;
+    }
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    handleNewMessages(h, t, peso);
+
+    Serial.printf("ENVIANDO -> Humedad: %.2f %% Temp: %.2f C Peso: %.2f g Abejas: %d\nTotal abejas : %d\n",
+                  h, t, peso, conteo_abejas, total_abejas);
+
+    // -------- LED SEGÚN ESTADO --------
+    ledState = !ledState;
+    // Rojo: error
+    // azul: anomalía
+    // amarillo: riesgo
+    // Condición 1: error de comunicación (NaN) prende led rojo
+    if (isnan(h) || isnan(t) || isnan(peso)) {
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AZUL, LOW);
+      digitalWrite(LED_ROJO, ledState ? HIGH : LOW); // Rojo titila
+      estado_colmena = "Error";
+    }
+    // Condición 3: daño de sensores
+    else if ((t < TEMP_EXMIN || t > TEMP_EXMAX) ||
+              (h < HUM_EXMIN || h > HUM_EXMAX) ||
+              (peso < PESO_EXMIN || peso > PESO_EXMAX)) {
+      digitalWrite(LED_AZUL, LOW);
+      digitalWrite(LED_ROJO, ledState ? HIGH : LOW);
+      digitalWrite(LED_VERDE, ledState ? HIGH : LOW); // Amarillo titila
+      estado_colmena = "Riesgo";
+    }
+    // Condición 2: fuera de umbrales, color azul
+    else if ((t < TEMP_MIN || t > TEMP_MAX) ||
+              (h < HUM_MIN || h > HUM_MAX) ||
+              (peso < PESO_MIN || peso > PESO_MAX)) {
+      digitalWrite(LED_ROJO, LOW);
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AZUL, ledState ? HIGH : LOW); // Azul titila
+      estado_colmena = "Anomalia";
+    }
+    // Condición 4: dentro de rango normal
+    else {
+      digitalWrite(LED_ROJO, LOW);
+      digitalWrite(LED_AZUL, LOW);
+      digitalWrite(LED_VERDE, ledState ? HIGH : LOW); // Verde titila
+      estado_colmena = "Normal";
+    }
+
+    WiFiClient client;
+    if (client.connect(host, port)) {
+      String url = "/proyecto_colmenas/programas_php/programa1.php?";
+      url += "humedad="; url += String(h);
+      url += "&temperatura="; url += String(t);
+      url += "&conteo_abejas="; url += String(conteo_abejas);
+      url += "&ID_TARJ="; url += String(ID_TARJ);
+      url += "&peso_colmena="; url += String(peso);
+      url += "&total_abejas="; url += String(total_abejas);
+      url += "&estado_colmena="; url += estado_colmena;
+      client.print("POST "); client.print(url); client.println(" HTTP/1.1");
+      client.print("Host: "); client.println(host);
+      client.println("Connection: close");
+      client.println();
+    }
+    client.stop();
+    Serial.println("Dato ENVIADO (modo no bloqueante)");
+  }
+}
